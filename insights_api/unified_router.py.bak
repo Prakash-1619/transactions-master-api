@@ -1,0 +1,542 @@
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from fastapi import APIRouter, Query
+from typing import Optional
+import pandas as pd
+import numpy as np
+from datetime import datetime
+
+# Import global data from market_router to avoid reloading memory
+from market_router import (
+    coords_df, 
+    calculate_distance
+)
+
+router = APIRouter()
+
+def get_feature_prices_df():
+    # Deprecated: Feature prices are now loaded entirely via filter_data using DuckDB
+    return None
+
+def filter_data(table_name: str, is_rental: bool, emirate: str, lat: float, lon: float, area: str, start_date: str, end_date: str, room_type: str, property_type: str, reg_type: str = None, transaction_type: str = None, year: int = None):
+    """Common filtering logic for both sales and rental using DuckDB pushdown."""
+    from duckdb_setup import get_db_connection
+    con = get_db_connection(read_only=True)
+    
+    where_clauses = []
+    params = []
+    
+    inferred_area = None
+    if lat is not None and lon is not None and not coords_df.empty:
+        temp_coords = coords_df.dropna(subset=['latitude', 'longitude']).copy()
+        if not temp_coords.empty:
+            lats = pd.to_numeric(temp_coords['latitude'], errors='coerce').values
+            lons = pd.to_numeric(temp_coords['longitude'], errors='coerce').values
+            
+            dlat = np.radians(lats - lat)
+            dlon = np.radians(lons - lon)
+            a = np.sin(dlat / 2)**2 + np.cos(np.radians(lat)) * np.cos(np.radians(lats)) * np.sin(dlon / 2)**2
+            c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
+            dists = 6371.0 * c
+            
+            min_idx = np.nanargmin(dists)
+            min_dist = dists[min_idx]
+            
+            from config import DEFAULT_RADIUS_KM
+            if min_dist <= DEFAULT_RADIUS_KM:
+                nearest = temp_coords.iloc[min_idx]
+                inferred_area = str(nearest['area_name']).lower()
+                if not emirate:
+                    emirate = nearest['emirate_source']
+            else:
+                return pd.DataFrame()
+                
+    if area and not emirate and not coords_df.empty:
+        matched = coords_df[coords_df['area_name'].astype(str).str.lower() == area.strip().lower()]
+        if not matched.empty:
+            emirate = matched.iloc[0]['emirate_source']
+
+    # Handle Emirate filter
+    if emirate:
+        if is_rental:
+            if emirate.strip().lower() == "abu dhabi":
+                return pd.DataFrame()
+        else:
+            where_clauses.append("lower(emirate) = lower(?)")
+            params.append(emirate.strip())
+    elif not emirate and (lat is None or lon is None):
+        return pd.DataFrame()
+
+    area_col = 'area_name_en' if is_rental else 'area'
+    if inferred_area:
+        where_clauses.append(f"lower({area_col}) = ?")
+        params.append(inferred_area)
+    elif area:
+        where_clauses.append(f"lower({area_col}) = lower(?)")
+        params.append(area.strip())
+
+    date_col = 'contract_start_date' if is_rental else 'date'
+    
+    # Rental dates are strings 'dd-mm-yyyy', Market dates are timestamps
+    date_expr = f"try_strptime({date_col}, '%d-%m-%Y')" if is_rental else date_col
+    
+    if is_rental:
+        where_clauses.append(f"{date_expr} <= current_date")
+        
+    if start_date:
+        where_clauses.append(f"{date_expr} >= try_strptime(?, '%Y-%m-%d')")
+        params.append(start_date)
+    if end_date:
+        where_clauses.append(f"{date_expr} <= try_strptime(?, '%Y-%m-%d')")
+        params.append(end_date)
+
+    if not start_date and not end_date:
+        if year:
+            where_clauses.append(f"date_part('year', {date_expr}) = ?")
+            params.append(year)
+
+    room_col = 'ejari_property_sub_type_en' if is_rental else 'room_type'
+    if room_type:
+        where_clauses.append(f"lower({room_col}) = lower(?)")
+        params.append(room_type.strip())
+        
+    prop_col = 'property_usage_en' if is_rental else 'property_usage'
+    if property_type:
+        where_clauses.append(f"lower({prop_col}) = lower(?)")
+        params.append(property_type.strip())
+
+    if not is_rental:
+        if reg_type:
+            where_clauses.append("lower(reg_type) = lower(?)")
+            params.append(reg_type.strip())
+            
+        if transaction_type:
+            where_clauses.append("lower(transaction_type) = lower(?)")
+            params.append(transaction_type.strip())
+
+    # Build SQL
+    where_sql = " AND ".join(where_clauses) if where_clauses else "1=1"
+    query = f"SELECT * FROM {table_name} WHERE {where_sql}"
+    
+    df = con.execute(query, params).df()
+    
+    # Outlier treatment (remove top 2% and bottom 2%)
+    if not df.empty:
+        if 'sale_price' in df.columns:
+            vals = df['sale_price'].dropna().values
+            if len(vals) > 0:
+                q_low, q_hi = np.percentile(vals, [2, 98])
+                df = df[(df['sale_price'] >= q_low) & (df['sale_price'] <= q_hi)]
+        if 'annual_amount' in df.columns:
+            vals = df['annual_amount'].dropna().values
+            if len(vals) > 0:
+                q_low, q_hi = np.percentile(vals, [2, 98])
+                df = df[(df['annual_amount'] >= q_low) & (df['annual_amount'] <= q_hi)]
+
+    return df
+
+@router.get("/tiles")
+def get_unified_tiles(
+    emirate: Optional[str] = Query(None, description="Dubai or Abu Dhabi"),
+    start_date: Optional[str] = Query(None, description="YYYY-MM-DD"),
+    end_date: Optional[str] = Query(None, description="YYYY-MM-DD"),
+    lat: Optional[float] = Query(None, description="Latitude for nearest area filtering"),
+    lon: Optional[float] = Query(None, description="Longitude for nearest area filtering"),
+    area: Optional[str] = Query(None, description="Area name"),
+    room_type: Optional[str] = Query(None, description="Room type"),
+    property_type: Optional[str] = Query(None, description="Property type"),
+    reg_type: Optional[str] = Query(None),
+    transaction_type: Optional[str] = Query(None)
+):
+    sales_df = filter_data('unified_market', False, emirate, lat, lon, area, start_date, end_date, room_type, property_type, reg_type, transaction_type)
+    rental_df = filter_data('unified_rental', True, emirate, lat, lon, area, start_date, end_date, room_type, property_type, reg_type, transaction_type)
+
+    tiles = {}
+    if not sales_df.empty:
+        tiles.update({
+            "median_sale_price": float(sales_df['sale_price'].median()) if 'sale_price' in sales_df.columns else 0.0,
+            "total_sales_volume": int(len(sales_df)),
+            "total_sales_aed": float(sales_df['sale_price'].sum()) if 'sale_price' in sales_df.columns else 0.0,
+            "median_rate_sqm": float(sales_df['rate_sqm'].median()) if 'rate_sqm' in sales_df.columns else 0.0
+        })
+    else:
+        tiles.update({"median_sale_price": 0.0, "total_sales_volume": 0, "total_sales_aed": 0.0, "median_rate_sqm": 0.0})
+
+    if not rental_df.empty:
+        tiles.update({"median_annual_rent": float(rental_df['annual_amount'].median()) if 'annual_amount' in rental_df.columns else 0.0})
+    else:
+        tiles.update({"median_annual_rent": 0.0})
+        
+    # Get growth metrics without strict date bounds to find MoM, QoQ, YoY for the latest data available
+    # We will pass start_date=None, end_date=None to get all history for these segments
+    sales_hist = filter_data('unified_market', False, emirate, lat, lon, area, None, None, room_type, property_type, reg_type, transaction_type)
+    rental_hist = filter_data('unified_rental', True, emirate, lat, lon, area, None, None, room_type, property_type, reg_type, transaction_type)
+    
+    growth_metrics = {}
+    
+    def calc_growth(df, date_col, val_col, period):
+        if df.empty or date_col not in df.columns or val_col not in df.columns:
+            return 0.0
+        df_c = df.copy()
+        # Convert to datetime explicitly if not already
+        df_c[date_col] = pd.to_datetime(df_c[date_col], format="%d-%m-%Y" if date_col == 'contract_start_date' else None, errors='coerce')
+        if period == 'D':
+            # Decade (10 years)
+            df_c['Period'] = df_c[date_col].dt.year // 10 * 10
+        else:
+            df_c['Period'] = df_c[date_col].dt.to_period(period)
+            
+        agg = df_c.groupby('Period')[val_col].median().reset_index()
+        if len(agg) < 2: return 0.0
+        agg['Growth'] = agg[val_col].pct_change(1)
+        
+        # return the most recent growth
+        val = agg.iloc[-1]['Growth']
+        return float(val) if pd.notnull(val) else 0.0
+
+    growth_metrics['mom_sales_growth'] = calc_growth(sales_hist, 'date', 'sale_price', 'M')
+    growth_metrics['qoq_sales_growth'] = calc_growth(sales_hist, 'date', 'sale_price', 'Q')
+    growth_metrics['yoy_sales_growth'] = calc_growth(sales_hist, 'date', 'sale_price', 'Y')
+    growth_metrics['decade_sales_growth'] = calc_growth(sales_hist, 'date', 'sale_price', 'D')
+    
+    growth_metrics['mom_rent_growth'] = calc_growth(rental_hist, 'contract_start_date', 'annual_amount', 'M')
+    growth_metrics['qoq_rent_growth'] = calc_growth(rental_hist, 'contract_start_date', 'annual_amount', 'Q')
+    growth_metrics['yoy_rent_growth'] = calc_growth(rental_hist, 'contract_start_date', 'annual_amount', 'Y')
+    growth_metrics['decade_rent_growth'] = calc_growth(rental_hist, 'contract_start_date', 'annual_amount', 'D')
+    
+    tiles.update(growth_metrics)
+
+    return {"status": "success", "tiles": tiles}
+
+@router.get("/growth_and_yield")
+def get_unified_growth_and_yield(
+    metric: str = Query("median_price", description="volume, median_price, median_rate, total_price"),
+    comparison_type: str = Query("yoy", description="yoy, qoq, or mom. Defaults to yoy."),
+    emirate: Optional[str] = Query(None, description="Dubai or Abu Dhabi"),
+    start_date: Optional[str] = Query(None, description="YYYY-MM-DD"),
+    end_date: Optional[str] = Query(None, description="YYYY-MM-DD"),
+    lat: Optional[float] = Query(None, description="Latitude for nearest area filtering"),
+    lon: Optional[float] = Query(None, description="Longitude for nearest area filtering"),
+    area: Optional[str] = Query(None, description="Area name"),
+    room_type: Optional[str] = Query(None, description="Room type"),
+    property_type: Optional[str] = Query(None, description="Property type"),
+    reg_type: Optional[str] = Query(None),
+    transaction_type: Optional[str] = Query(None)
+):
+    sales_df = filter_data('unified_market', False, emirate, lat, lon, area, start_date, end_date, room_type, property_type, reg_type, transaction_type)
+    rental_df = filter_data('unified_rental', True, emirate, lat, lon, area, start_date, end_date, room_type, property_type, reg_type, transaction_type)
+
+    if sales_df.empty and rental_df.empty:
+        return {"message": "No data found for the given criteria."}
+
+    # Aggregate based on comparison type
+    period = 'Y' if comparison_type == 'yoy' else ('Q' if comparison_type == 'qoq' else 'M')
+    
+    def agg_logic(group, m, is_rent):
+        val_col = 'annual_amount' if is_rent else 'sale_price'
+        if m == "volume":
+            return group.shape[0]
+        elif m == "total_price":
+            return group[val_col].sum()
+        elif m == "median_rate" and not is_rent:
+            if 'rate_sqm' in group.columns:
+                return group['rate_sqm'].median()
+            return 0.0
+        else:
+            return group[val_col].median()
+            
+    if not sales_df.empty:
+        sales_df['date'] = pd.to_datetime(sales_df['date'], errors='coerce')
+        sales_df['Period'] = sales_df['date'].dt.to_period(period)
+        sales_agg = sales_df.groupby('Period').apply(lambda g: agg_logic(g, metric, False), include_groups=False).reset_index(name='Sales_Value')
+        sales_agg['Sales_Growth'] = sales_agg['Sales_Value'].pct_change(1)
+        sales_agg['Period'] = sales_agg['Period'].astype(str)
+    else:
+        sales_agg = pd.DataFrame(columns=['Period', 'Sales_Value', 'Sales_Growth'])
+
+    if not rental_df.empty:
+        rental_df['contract_start_date'] = pd.to_datetime(rental_df['contract_start_date'], format="%d-%m-%Y", errors='coerce')
+        rental_df['Period'] = rental_df['contract_start_date'].dt.to_period(period)
+        rental_agg = rental_df.groupby('Period').apply(lambda g: agg_logic(g, metric, True), include_groups=False).reset_index(name='Rental_Value')
+        rental_agg['Rental_Growth'] = rental_agg['Rental_Value'].pct_change(1)
+        rental_agg['Period'] = rental_agg['Period'].astype(str)
+    else:
+        rental_agg = pd.DataFrame(columns=['Period', 'Rental_Value', 'Rental_Growth'])
+
+    combined_agg = pd.merge(sales_agg, rental_agg, on='Period', how='outer').sort_values('Period')
+    
+    if metric in ["median_price"]:
+        combined_agg['Gross_Rental_Yield'] = np.where(
+            combined_agg['Sales_Value'] > 0,
+            (combined_agg['Rental_Value'] / combined_agg['Sales_Value']) * 100,
+            np.nan
+        )
+        combined_agg['Yield_Growth'] = combined_agg['Gross_Rental_Yield'].pct_change(1)
+
+    combined_agg = combined_agg.replace([np.inf, -np.inf], np.nan)
+    combined_agg = combined_agg.astype(object).where(pd.notnull(combined_agg), None)
+    
+    return {"status": "success", "data": combined_agg.to_dict(orient="records")}
+
+@router.get("/distributions/price_bins")
+def get_price_bins(
+    metric: str = Query("volume", description="volume, median_price, median_rate, total_price"),
+    is_rental: bool = Query(False, description="True for rentals, False for sales"),
+    emirate: Optional[str] = Query(None, description="Dubai or Abu Dhabi"),
+    start_date: Optional[str] = Query(None),
+    end_date: Optional[str] = Query(None),
+    lat: Optional[float] = Query(None),
+    lon: Optional[float] = Query(None),
+    area: Optional[str] = Query(None),
+    room_type: Optional[str] = Query(None),
+    property_type: Optional[str] = Query(None),
+    reg_type: Optional[str] = Query(None),
+    transaction_type: Optional[str] = Query(None)
+):
+    df = filter_data('unified_rental' if is_rental else 'unified_market', is_rental, emirate, lat, lon, area, start_date, end_date, room_type, property_type, reg_type, transaction_type)
+    if df.empty:
+        return []
+    target_col = 'annual_amount' if is_rental else 'sale_price'
+    if target_col not in df.columns or df[target_col].dropna().empty:
+        return []
+
+    bins = [0, 500000, 1000000, 3000000, 10000000, float('inf')]
+    labels = ["Low Budget", "Budget Friendly", "Mid Range", "Premium", "Ultra Premium"]
+    
+    # adjust for rental
+    if is_rental:
+        bins = [0, 30000, 60000, 100000, 250000, float('inf')]
+        
+    df['Budget_Category'] = pd.cut(df[target_col], bins=bins, labels=labels, right=False)
+    
+    if metric == "total_price":
+        counts = df.groupby('Budget_Category', observed=True)[target_col].sum().reset_index(name='Count')
+    elif metric == "median_price":
+        counts = df.groupby('Budget_Category', observed=True)[target_col].median().reset_index(name='Count')
+    elif metric == "median_rate" and not is_rental and 'rate_sqm' in df.columns:
+        counts = df.groupby('Budget_Category', observed=True)['rate_sqm'].median().reset_index(name='Count')
+    else:
+        counts = df.groupby('Budget_Category', observed=True).size().reset_index(name='Count')
+        
+    counts = counts.replace([np.inf, -np.inf], np.nan).astype(object).where(pd.notnull(counts), None)
+    return counts.to_dict(orient='records')
+
+@router.get("/area_vs_price")
+def get_area_vs_price(
+    metric: str = Query("median_rate", description="volume, median_price, median_rate, total_price"),
+    emirate: Optional[str] = Query(None),
+    start_date: Optional[str] = Query(None),
+    end_date: Optional[str] = Query(None),
+    lat: Optional[float] = Query(None),
+    lon: Optional[float] = Query(None),
+    area: Optional[str] = Query(None),
+    room_type: Optional[str] = Query(None),
+    property_type: Optional[str] = Query(None),
+    reg_type: Optional[str] = Query(None),
+    transaction_type: Optional[str] = Query(None)
+,
+    year: int = Query(2026, description="Year (defaults to 2026)"),
+    limit: int = Query(300, description="Number of records for scatter plot")
+):
+    df = filter_data('unified_market', False, emirate, lat, lon, area, start_date, end_date, room_type, property_type, reg_type, transaction_type, year)
+    if df.empty or 'area_sqm' not in df.columns:
+        return {"binned_data": [], "scatter_data": []}
+        
+    # 1. Binned Data for Bar Chart
+    bins = [0, 50, 100, 150, 200, 500, float('inf')]
+    labels = ["0-50 sqm", "50-100 sqm", "100-150 sqm", "150-200 sqm", "200-500 sqm", "500+ sqm"]
+    df['Area_SQM_Bin'] = pd.cut(df['area_sqm'], bins=bins, labels=labels, right=False)
+    
+    # 2. Scatter Data (Rounding area to reduce cardinality and massive grouping times)
+    df['area_sqm_rounded'] = df['area_sqm'].round(0)
+    scatter_grouping = ['area_sqm_rounded', 'room_type'] if 'room_type' in df.columns else ['area_sqm_rounded']
+    
+    if metric == "volume":
+        agg_df = df.groupby('Area_SQM_Bin', observed=True).size().reset_index(name='Value')
+        scatter_agg = df.groupby(scatter_grouping, observed=True).size().reset_index(name='Value')
+    elif metric == "total_price" and 'sale_price' in df.columns:
+        agg_df = df.groupby('Area_SQM_Bin', observed=True)['sale_price'].sum().reset_index(name='Value')
+        scatter_agg = df.groupby(scatter_grouping, observed=True)['sale_price'].sum().reset_index(name='Value')
+    elif metric == "median_price" and 'sale_price' in df.columns:
+        agg_df = df.groupby('Area_SQM_Bin', observed=True)['sale_price'].median().reset_index(name='Value')
+        scatter_agg = df.groupby(scatter_grouping, observed=True)['sale_price'].median().reset_index(name='Value')
+    else: # median_rate (default)
+        if 'rate_sqm' in df.columns:
+            agg_df = df.groupby('Area_SQM_Bin', observed=True)['rate_sqm'].median().reset_index(name='Value')
+            scatter_agg = df.groupby(scatter_grouping, observed=True)['rate_sqm'].median().reset_index(name='Value')
+        else:
+            agg_df = pd.DataFrame(columns=['Area_SQM_Bin', 'Value'])
+            scatter_agg = pd.DataFrame(columns=scatter_grouping + ['Value'])
+            
+    # Rename rounded back to area_sqm for the UI
+    if not scatter_agg.empty:
+        scatter_agg = scatter_agg.head(limit)
+        scatter_agg = scatter_agg.rename(columns={'area_sqm_rounded': 'area_sqm'})
+
+    agg_df = agg_df.replace([np.inf, -np.inf], np.nan).astype(object).where(pd.notnull(agg_df), None)
+    scatter_agg = scatter_agg.replace([np.inf, -np.inf], np.nan).astype(object).where(pd.notnull(scatter_agg), None)
+
+    return {
+        "binned_data": agg_df.to_dict(orient="records"),
+        "scatter_data": scatter_agg.to_dict(orient="records")
+    }
+
+@router.get("/feature_prices")
+def get_feature_prices(
+    emirate: Optional[str] = Query(None),
+    start_date: Optional[str] = Query(None),
+    end_date: Optional[str] = Query(None),
+    lat: Optional[float] = Query(None),
+    lon: Optional[float] = Query(None),
+    area: Optional[str] = Query(None),
+    room_type: Optional[str] = Query(None),
+    property_type: Optional[str] = Query(None),
+    reg_type: Optional[str] = Query(None),
+    transaction_type: Optional[str] = Query(None)
+):
+    filtered = filter_data('unified_feature_prices', False, emirate, lat, lon, area, start_date, end_date, room_type, property_type, reg_type, transaction_type)
+    if filtered.empty:
+        return {"status": "success", "data": {}}
+        
+    features = ['floor_bin', 'has_parking', 'swimming_pool', 'elevator', 'metro']
+    results = {}
+    for feature in features:
+        if feature in filtered.columns:
+            # calculate median sale price and rate sqm
+            grouped = filtered.groupby(feature).agg(
+                median_sale_price=('sale_price', 'median'),
+                median_rate_sqm=('rate_sqm', 'median')
+            ).dropna().to_dict(orient='index')
+            results[feature] = grouped
+    return {"status": "success", "data": results}
+
+@router.get("/top_bottom_performers")
+def get_top_bottom_performers(
+    emirate: Optional[str] = Query(None),
+    start_date: Optional[str] = Query(None),
+    end_date: Optional[str] = Query(None),
+    lat: Optional[float] = Query(None),
+    lon: Optional[float] = Query(None),
+    area: Optional[str] = Query(None),
+    room_type: Optional[str] = Query(None),
+    property_type: Optional[str] = Query(None),
+    reg_type: Optional[str] = Query(None),
+    transaction_type: Optional[str] = Query(None),
+    dimension: str = Query("area", description="'area' or 'project_name'")
+):
+    df = filter_data('unified_market', False, emirate, lat, lon, area, start_date, end_date, room_type, property_type, reg_type, transaction_type)
+    if df.empty or dimension not in df.columns:
+        return {"status": "success", "data": {}}
+        
+    grouped = df.groupby(dimension).agg(
+        volume=('sale_price', 'size'),
+        median_rate_sqm=('rate_sqm', 'median'),
+        sum_sold_prices=('sale_price', 'sum')
+    ).reset_index()
+    
+    results = {}
+    for metric in ['volume', 'median_rate_sqm', 'sum_sold_prices']:
+        sorted_df = grouped.sort_values(by=metric, ascending=False)
+        top = sorted_df.head(10).replace([np.inf, -np.inf], np.nan).where(pd.notnull(sorted_df), None).to_dict(orient='records')
+        bottom = sorted_df.tail(10).replace([np.inf, -np.inf], np.nan).where(pd.notnull(sorted_df), None).to_dict(orient='records')
+        results[metric] = {"top": top, "bottom": bottom}
+        
+    return {"status": "success", "data": results}
+
+@router.get("/distributions/grouped")
+def get_grouped_distributions(
+    metric: str = Query("volume", description="volume, median_price, median_rate, total_price"),
+    is_rental: bool = Query(False),
+    emirate: Optional[str] = Query(None),
+    start_date: Optional[str] = Query(None),
+    end_date: Optional[str] = Query(None),
+    lat: Optional[float] = Query(None),
+    lon: Optional[float] = Query(None),
+    area: Optional[str] = Query(None),
+    room_type: Optional[str] = Query(None),
+    property_type: Optional[str] = Query(None),
+    reg_type: Optional[str] = Query(None),
+    transaction_type: Optional[str] = Query(None),
+    group_by: str = Query(..., description="Column to group by (e.g., room_type, property_type)")
+):
+    df = filter_data('unified_rental' if is_rental else 'unified_market', is_rental, emirate, lat, lon, area, start_date, end_date, room_type, property_type, reg_type, transaction_type)
+    if df.empty or group_by not in df.columns:
+        return []
+        
+    target_col = 'annual_amount' if is_rental else 'sale_price'
+        
+    if metric == "total_price" and target_col in df.columns:
+        counts = df.groupby(group_by)[target_col].sum().reset_index(name='Count')
+    elif metric == "median_price" and target_col in df.columns:
+        counts = df.groupby(group_by)[target_col].median().reset_index(name='Count')
+    elif metric == "median_rate" and not is_rental and 'rate_sqm' in df.columns:
+        counts = df.groupby(group_by)['rate_sqm'].median().reset_index(name='Count')
+    else:
+        counts = df.groupby(group_by).size().reset_index(name='Count')
+        
+    counts.columns = [group_by, 'Count']
+    counts = counts.replace([np.inf, -np.inf], np.nan).astype(object).where(pd.notnull(counts), None)
+    return counts.to_dict(orient='records')
+
+@router.get("/plots/unified_growth")
+def plot_unified_growth(
+    metric: str = Query("median_price", description="volume, median_price, median_rate, total_price"),
+    comparison_type: str = Query("yoy", description="yoy, qoq, or mom. Defaults to yoy."),
+    emirate: Optional[str] = Query(None, description="Dubai or Abu Dhabi"),
+    start_date: Optional[str] = Query(None, description="YYYY-MM-DD"),
+    end_date: Optional[str] = Query(None, description="YYYY-MM-DD"),
+    lat: Optional[float] = Query(None, description="Latitude for nearest area filtering"),
+    lon: Optional[float] = Query(None, description="Longitude for nearest area filtering"),
+    area: Optional[str] = Query(None, description="Area name"),
+    room_type: Optional[str] = Query(None, description="Room type"),
+    property_type: Optional[str] = Query(None, description="Property type"),
+    reg_type: Optional[str] = Query(None),
+    transaction_type: Optional[str] = Query(None)
+):
+    return get_unified_growth_and_yield(metric, comparison_type, emirate, start_date, end_date, lat, lon, area, room_type, property_type, reg_type, transaction_type)
+
+@router.get("/transactions")
+def get_transactions(
+    is_rental: bool = Query(False, description="True for rentals, False for sales"),
+    page: int = Query(1, ge=1, description="Page number"),
+    size: int = Query(25, ge=1, le=50, description="Records per page"),
+    emirate: Optional[str] = Query(None),
+    start_date: Optional[str] = Query(None),
+    end_date: Optional[str] = Query(None),
+    lat: Optional[float] = Query(None),
+    lon: Optional[float] = Query(None),
+    area: Optional[str] = Query(None),
+    room_type: Optional[str] = Query(None),
+    property_type: Optional[str] = Query(None),
+    reg_type: Optional[str] = Query(None),
+    transaction_type: Optional[str] = Query(None)
+):
+    df = filter_data('unified_rental' if is_rental else 'unified_market', is_rental, emirate, lat, lon, area, start_date, end_date, room_type, property_type, reg_type, transaction_type)
+    if df.empty:
+        return {"data": [], "page": page, "size": size, "total_records": 0, "total_pages": 0}
+        
+    date_col = 'contract_start_date' if is_rental else 'date'
+    if date_col in df.columns:
+        df = df.sort_values(date_col, ascending=False)
+        
+    total_records = len(df)
+    total_pages = int(np.ceil(total_records / size))
+    
+    start_idx = (page - 1) * size
+    end_idx = start_idx + size
+    
+    # slice page
+    page_df = df.iloc[start_idx:end_idx]
+    
+    # Replace NaNs for JSON compliance
+    page_df = page_df.replace([np.inf, -np.inf], np.nan).astype(object).where(pd.notnull(page_df), None)
+    
+    return {
+        "status": "success",
+        "data": page_df.to_dict(orient="records"),
+        "page": page,
+        "size": size,
+        "total_records": total_records,
+        "total_pages": total_pages
+    }
