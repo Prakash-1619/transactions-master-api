@@ -306,13 +306,6 @@ def get_market_trends(
     group_by: Optional[str] = Query(None, description="Column name to break down market trends (e.g. area)")
 ):
     df = filter_data('unified_market', False, emirate, lat, lon, area, start_date, end_date, room_type, property_type, reg_type, transaction_type, None)
-    
-    shift_period = 12
-    if comparison_type.lower() == 'qoq':
-        shift_period = 3
-    elif comparison_type.lower() == 'mom':
-        shift_period = 1
-        
     # Aggregation
     market_trend = df.groupby('Month_Year').agg(
         Volume=('sale_price', 'size'),
@@ -407,12 +400,193 @@ def get_rental_trends(
     if df.empty:
         return {"message": "Rental data is not available."}
     
-    shift_period = 12
-    if comparison_type.lower() == 'qoq':
-        shift_period = 3
-    elif comparison_type.lower() == 'mom':
-        shift_period = 1
+    # Aggregation
+    market_trend = df.groupby('Month_Year').agg(
+        Volume=('annual_amount', 'size'),
+        Total_Sales_AED=('annual_amount', 'sum'),
+        Median_Annual_Rent=('annual_amount', 'median')
+    ).reset_index()
+    market_trend['Median_Sale_Price'] = None
+    market_trend['Median_Rate'] = None
+    
+    metric_col_map = {
+        "volume": "Volume",
+        "total_sales": "Total_Sales_AED",
+        "median_annual_rent": "Median_Annual_Rent"
+    }
+    target_metric_col = metric_col_map.get(growth_metric.lower(), "Median_Annual_Rent")
+    
+    growth_col_name = f"{comparison_type.upper()}_{growth_metric.upper()}_GROWTH"
+    
+    if target_metric_col in market_trend.columns and market_trend[target_metric_col].notna().any():
+        market_trend[growth_col_name] = market_trend[target_metric_col].astype(float).pct_change(periods=shift_period)
+    else:
+        market_trend[growth_col_name] = None
+    
+    market_trend['Month_Year'] = market_trend['Month_Year'].astype(str)
+    market_trend = market_trend.replace([np.inf, -np.inf], np.nan)
+    market_trend = market_trend.astype(object).where(pd.notnull(market_trend), None)
+    
+    group_insights = {}
+    if group_by and group_by in df.columns:
+        group_data = df.groupby([group_by, 'Month_Year']).agg(
+            Volume=('annual_amount', 'size'),
+            Total_Sales_AED=('annual_amount', 'sum'),
+            Median_Annual_Rent=('annual_amount', 'median')
+        ).reset_index()
+        group_data['Median_Sale_Price'] = None
+        group_data['Median_Rate'] = None
         
+        group_data = group_data.sort_values([group_by, 'Month_Year'])
+        
+        if target_metric_col in group_data.columns and group_data[target_metric_col].notna().any():
+            group_data[growth_col_name] = group_data.groupby(group_by)[target_metric_col].pct_change(periods=shift_period)
+        else:
+            group_data[growth_col_name] = None
+            
+        group_data['Month_Year'] = group_data['Month_Year'].astype(str)
+        group_data = group_data.replace([np.inf, -np.inf], np.nan)
+        group_data = group_data.astype(object).where(pd.notnull(group_data), None)
+        
+        for group_name, df_group in group_data.groupby(group_by):
+            group_insights[str(group_name)] = df_group.tail(1).to_dict(orient="records")[0]
+            
+    # Include distributions
+    distributions = {}
+    for col, display_name in [('ejari_property_sub_type_en', 'room_type'), ('ejari_property_type_en', 'property_type')]:
+        if col in df.columns:
+            counts = df[col].value_counts().reset_index()
+            counts.columns = [display_name, 'count']
+            distributions[display_name] = counts.to_dict(orient='records')
+            
+    return {
+        "analysis_params": {
+            "comparison_type": comparison_type.upper(),
+            "growth_metric_tracked": growth_metric.upper(),
+            "timeframe_analyzed": {
+                "start": df['contract_start_date'].min().strftime('%Y-%m-%d'),
+                "end": df['contract_start_date'].max().strftime('%Y-%m-%d')
+            }
+        },
+        "overall_market_latest": market_trend.iloc[-1].to_dict() if not market_trend.empty else {},
+        "overall_market_history": market_trend.to_dict(orient="records"),
+        "grouped_breakdown": group_insights if group_insights else "No group_by column specified.",
+        "distributions": distributions
+    }
+
+from insights_api.unified_router import filter_data
+
+@router.get("/insights/trends")
+def get_market_trends(
+    emirate: Optional[str] = Query(None, description="Dubai or Abu Dhabi"),
+    start_date: Optional[str] = Query(None, description="YYYY-MM-DD"),
+    end_date: Optional[str] = Query(None, description="YYYY-MM-DD"),
+    lat: Optional[float] = Query(None, description="Latitude for nearest area filtering"),
+    lon: Optional[float] = Query(None, description="Longitude for nearest area filtering"),
+    reg_type: Optional[str] = Query(None, description="Registration type"),
+    transaction_type: Optional[str] = Query(None, description="Transaction type"),
+    area: Optional[str] = Query(None, description="Area name"),
+    room_type: Optional[str] = Query(None, description="Room type"),
+    property_type: Optional[str] = Query(None, description="Property type"),
+    comparison_type: str = Query("yoy", description="yoy, qoq, or mom. Defaults to yoy."),
+    growth_metric: str = Query("median_sale_price", description="Metric to calculate growth on"),
+    group_by: Optional[str] = Query(None, description="Column name to break down market trends (e.g. area)")
+):
+    df = filter_data('unified_market', False, emirate, lat, lon, area, start_date, end_date, room_type, property_type, reg_type, transaction_type, None)
+    # Aggregation
+    market_trend = df.groupby('Month_Year').agg(
+        Volume=('sale_price', 'size'),
+        Total_Sales_AED=('sale_price', 'sum'),
+        Median_Sale_Price=('sale_price', 'median'),
+        Median_Rate=('rate_sqm', 'median')
+    ).reset_index()
+    # We do not have rental actual worth in global_df currently, mock to null
+    market_trend['Median_Annual_Rent'] = None
+    
+    metric_col_map = {
+        "volume": "Volume",
+        "total_sales": "Total_Sales_AED",
+        "median_sale_price": "Median_Sale_Price",
+        "median_rate": "Median_Rate",
+        "median_annual_rent": "Median_Annual_Rent"
+    }
+    target_metric_col = metric_col_map.get(growth_metric.lower(), "Median_Sale_Price")
+    
+    growth_col_name = f"{comparison_type.upper()}_{growth_metric.upper()}_GROWTH"
+    
+    if target_metric_col in market_trend.columns and market_trend[target_metric_col].notna().any():
+        market_trend[growth_col_name] = market_trend[target_metric_col].astype(float).pct_change(periods=shift_period)
+    else:
+        market_trend[growth_col_name] = None
+    
+    market_trend['Month_Year'] = market_trend['Month_Year'].astype(str)
+    market_trend = market_trend.replace([np.inf, -np.inf], np.nan)
+    market_trend = market_trend.astype(object).where(pd.notnull(market_trend), None)
+    
+    group_insights = {}
+    if group_by and group_by in df.columns:
+        group_data = df.groupby([group_by, 'Month_Year']).agg(
+            Volume=('sale_price', 'size'),
+            Total_Sales_AED=('sale_price', 'sum'),
+            Median_Sale_Price=('sale_price', 'median'),
+            Median_Rate=('rate_sqm', 'median')
+        ).reset_index()
+        group_data['Median_Annual_Rent'] = None
+        
+        group_data = group_data.sort_values([group_by, 'Month_Year'])
+        
+        if target_metric_col in group_data.columns and group_data[target_metric_col].notna().any():
+            group_data[growth_col_name] = group_data.groupby(group_by)[target_metric_col].pct_change(periods=shift_period)
+        else:
+            group_data[growth_col_name] = None
+            
+        group_data['Month_Year'] = group_data['Month_Year'].astype(str)
+        group_data = group_data.replace([np.inf, -np.inf], np.nan)
+        group_data = group_data.astype(object).where(pd.notnull(group_data), None)
+        
+        for group_name, df_group in group_data.groupby(group_by):
+            group_insights[str(group_name)] = df_group.tail(1).to_dict(orient="records")[0]
+            
+    # Include distributions for a quick overview
+    distributions = {}
+    for col, display_name in [('room_type', 'rooms_en'), ('transaction_type', 'transaction_type'), ('reg_type', 'regtype')]:
+        if col in df.columns:
+            counts = df[col].value_counts().reset_index()
+            counts.columns = [display_name, 'count']
+            distributions[display_name] = counts.to_dict(orient='records')
+            
+    return {
+        "analysis_params": {
+            "comparison_type": comparison_type.upper(),
+            "growth_metric_tracked": growth_metric.upper(),
+            "timeframe_analyzed": {
+                "start": df['date'].min().strftime('%Y-%m-%d'),
+                "end": df['date'].max().strftime('%Y-%m-%d')
+            }
+        },
+        "overall_market_latest": market_trend.iloc[-1].to_dict() if not market_trend.empty else {},
+        "overall_market_history": market_trend.to_dict(orient="records"),
+        "grouped_breakdown": group_insights if group_insights else "No group_by column specified.",
+        "distributions": distributions
+    }
+
+@router.get("/insights/rental_trends")
+def get_rental_trends(
+    start_date: Optional[str] = Query(None, description="YYYY-MM-DD"),
+    end_date: Optional[str] = Query(None, description="YYYY-MM-DD"),
+    lat: Optional[float] = Query(None, description="Latitude for nearest area filtering"),
+    lon: Optional[float] = Query(None, description="Longitude for nearest area filtering"),
+    area: Optional[str] = Query(None, description="Area name"),
+    room_type: Optional[str] = Query(None, description="Room type"),
+    property_type: Optional[str] = Query(None, description="Property type"),
+    comparison_type: str = Query("yoy", description="yoy, qoq, or mom. Defaults to yoy."),
+    growth_metric: str = Query("median_annual_rent", description="Metric to calculate growth on"),
+    group_by: Optional[str] = Query(None, description="Column name to break down market trends (e.g. area_name_en)")
+):
+    df = filter_data('unified_rental', True, emirate, lat, lon, area, start_date, end_date, room_type, property_type, None, None, None)
+    if df.empty:
+        return {"message": "Rental data is not available."}
+    
     # Aggregation
     market_trend = df.groupby('Month_Year').agg(
         Volume=('annual_amount', 'size'),
