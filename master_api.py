@@ -2,6 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import os
 
+from roi_router import router as roi_router, init_roi_data
 from market_router import router as market_router
 from duckdb_setup import init_db
 
@@ -17,7 +18,8 @@ app.add_middleware(
 
 @app.on_event("startup")
 def startup_event():
-    pass
+    # Initialize ROI cache if missing
+    init_roi_data()
     # Initialize DuckDB tables from R2
     # init_db()  # Removed local caching per user request
 
@@ -26,6 +28,10 @@ def root():
     return {
         "message": "Welcome to the Real Estate Insights Master API. Navigate to /docs for interactive documentation.",
         "endpoints": {
+            "roi": {
+                "refresh_data": "POST /api/v1/roi/refresh-data",
+                "calculate_roi": "GET /api/v1/roi/calculate_roi"
+            },
             "unified_market": {
                 "refresh_data": "POST /market/refresh-data",
                 "insights": "GET /market/insights"
@@ -34,6 +40,7 @@ def root():
     }
 
 # Mount routers
+app.include_router(roi_router, prefix="/api/v1/roi", tags=["ROI Calculator"])
 app.include_router(market_router, prefix="/market", tags=["Unified Market API"])
 
 from insights_api.unified_router import router as unified_router
