@@ -385,12 +385,126 @@ def get_transactions(
     }
 
 @router.get("/feature_prices")
-def get_feature_prices():
-    return {"status": "success", "data": {"Pool": {"premium_pct": 15}, "Metro": {"premium_pct": 25}}}
+def get_feature_prices(
+    emirate: Optional[str] = Query(None), start_date: Optional[str] = Query(None),
+    end_date: Optional[str] = Query(None), lat: Optional[float] = Query(None),
+    lon: Optional[float] = Query(None), area: Optional[str] = Query(None),
+    room_type: Optional[str] = Query(None), property_type: Optional[str] = Query(None),
+    reg_type: Optional[str] = Query(None), transaction_type: Optional[str] = Query(None)
+):
+    try:
+        table = "read_parquet('s3://truestates-re-analytics/dubai/data/processed/latest_combined_data.parquet')"
+        
+        # Build where clause manually for raw data since names differ slightly
+        where_clauses = ["actual_worth > 0"]
+        if area: where_clauses.append(f"lower(area_name_en) = '{area.lower().replace(chr(39), chr(39)+chr(39))}'")
+        if start_date: where_clauses.append(f"try_strptime(instance_date, '%d-%m-%Y %H:%M:%S') >= try_strptime('{start_date}', '%Y-%m-%d')")
+        if end_date: where_clauses.append(f"try_strptime(instance_date, '%d-%m-%Y %H:%M:%S') <= try_strptime('{end_date}', '%Y-%m-%d')")
+        if property_type: where_clauses.append(f"lower(property_type_en) = '{property_type.lower()}'")
+        if room_type: where_clauses.append(f"lower(rooms_en) = '{room_type.lower()}'")
+        if reg_type: where_clauses.append(f"lower(reg_type_en) = '{reg_type.lower()}'")
+        
+        sw = " AND ".join(where_clauses)
+        
+        features = {
+            "Metro": "metro",
+            "Balcony": "balcony",
+            "Elevator": "elevator",
+            "Swimming Pool": "swimming_pool"
+        }
+        
+        data = {}
+        for label, col in features.items():
+            query_with = f"SELECT median(actual_worth) FROM {table} WHERE {sw} AND {col} = 1"
+            query_without = f"SELECT median(actual_worth) FROM {table} WHERE {sw} AND ({col} IS NULL OR {col} = 0)"
+            
+            p_with = con.execute(query_with).fetchone()[0] or 0
+            p_without = con.execute(query_without).fetchone()[0] or 0
+            
+            data[label] = {
+                "With": round(p_with, 2),
+                "Without": round(p_without, 2),
+                "premium_pct": round(((p_with - p_without) / p_without * 100), 1) if p_without > 0 else 0
+            }
+            
+        # Floor Bin Distribution
+        query_floor = f"""
+            SELECT 
+                CASE 
+                    WHEN try_cast(floors as int) IS NULL THEN 'Unknown/Below 1st Floor'
+                    WHEN floors < 1 THEN 'Unknown/Below 1st Floor'
+                    WHEN floors >= 1 AND floors <= 10 THEN '1 to 10'
+                    WHEN floors > 10 AND floors <= 20 THEN '11 to 20'
+                    WHEN floors > 20 AND floors <= 30 THEN '21 to 30'
+                    WHEN floors > 30 AND floors <= 40 THEN '31 to 40'
+                    WHEN floors > 40 AND floors <= 50 THEN '41 to 50'
+                    WHEN floors > 50 AND floors <= 60 THEN '51 to 60'
+                    WHEN floors > 60 AND floors <= 70 THEN '61 to 70'
+                    WHEN floors > 70 AND floors <= 80 THEN '71 to 80'
+                    WHEN floors > 80 THEN '81+'
+                    ELSE 'Unknown/Below 1st Floor'
+                END as Name, 
+                median(actual_worth) as Median_Price 
+            FROM {table} 
+            WHERE {sw}
+            GROUP BY 1
+        """
+        floor_df = con.execute(query_floor).df()
+        data["Floor_Distribution"] = floor_df.to_dict(orient="records")
+        
+        return {"status": "success", "data": data}
+    except Exception as e:
+        print("Error in feature_prices:", e)
+        return {"status": "error", "message": str(e)}
 
 @router.get("/top_bottom_performers")
-def get_top_bottom(metric: str = Query("median_price")):
-    return {"status": "success", "data": {"top": [{"area": "Marina", "growth": 0.15}], "bottom": [{"area": "Al Nahda", "growth": -0.05}]}}
+def get_top_bottom(
+    metric: str = Query("volume"), group_by: str = Query("area"),
+    emirate: Optional[str] = Query(None), start_date: Optional[str] = Query(None),
+    end_date: Optional[str] = Query(None), lat: Optional[float] = Query(None),
+    lon: Optional[float] = Query(None), area: Optional[str] = Query(None),
+    room_type: Optional[str] = Query(None), property_type: Optional[str] = Query(None),
+    reg_type: Optional[str] = Query(None), transaction_type: Optional[str] = Query(None)
+):
+    sw, s_emirate = get_filter_clause(False, emirate, lat, lon, area, start_date, end_date, room_type, property_type, reg_type, transaction_type)
+    table = get_base_table('unified_market', s_emirate)
+    
+    if metric == "volume": agg = "count(*)"
+    elif metric == "total_sales": agg = "sum(sale_price)"
+    elif metric == "median_sale_price": agg = "median(sale_price)"
+    elif metric == "median_meter_sale_price": agg = "median(rate_sqm)"
+    else: agg = "median(sale_price)"
+    
+    gb = "project_name" if group_by == "project_name" else "area"
+    
+    try:
+        query = f"""
+            SELECT {gb} as name, {agg} as val
+            FROM {table}
+            WHERE {sw} AND {gb} IS NOT NULL AND {gb} != ''
+            GROUP BY 1
+        """
+        df = con.execute(query).df()
+        
+        if df.empty:
+            return {"status": "success", "data": {"top": [], "bottom": []}}
+            
+        df = df.dropna()
+        df = df.sort_values('val', ascending=False)
+        
+        top = df.head(10)
+        bot = df.tail(10)
+        
+        return {
+            "status": "success",
+            "data": {
+                "top": [{"name": r['name'], "value": r['val']} for _, r in top.iterrows()],
+                "bottom": [{"name": r['name'], "value": r['val']} for _, r in bot.iterrows()]
+            }
+        }
+    except Exception as e:
+        print("Error in top_bottom:", e)
+        return {"status": "error", "message": str(e)}
 
 def filter_data(table_name, is_rental, emirate, lat, lon, area, start_date, end_date, room_type, property_type, reg_type, transaction_type, year):
     sw, s_emirate = get_filter_clause(is_rental, emirate, lat, lon, area, start_date, end_date, room_type, property_type, reg_type, transaction_type, year)
