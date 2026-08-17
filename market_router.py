@@ -485,3 +485,4 @@ def get_rental_trends(
         "overall_market_history": market_trend.to_dict(orient="records"),
         "grouped_breakdown": group_insights if group_insights else "No group_by column specified.",
         "distributions": distributions
+    }
