@@ -175,6 +175,31 @@ with tab1:
         except Exception as e:
             st.error(f"Error loading grouped distribution: {e}")
 
+    st.markdown("---")
+    st.subheader("Top & Bottom Performers")
+    tb_col1, tb_col2 = st.columns(2)
+    tb_group = tb_col1.selectbox("Group By", ["area", "project_name"])
+    tb_metric = tb_col2.selectbox("Metric", ["volume", "total_sales", "median_sale_price", "median_meter_sale_price"])
+    try:
+        tb_resp = requests.get(f"{API_BASE_URL}/market/insights/unified/top_bottom_performers", params=build_params({"group_by": tb_group, "metric": tb_metric})).json()
+        if tb_resp.get("status") == "success" and tb_resp.get("data"):
+            top_df = pd.DataFrame(tb_resp["data"].get("top_10", []))
+            bottom_df = pd.DataFrame(tb_resp["data"].get("bottom_10", []))
+            
+            c1, c2 = st.columns(2)
+            with c1:
+                if not top_df.empty:
+                    fig_top = px.bar(top_df, x="Value", y="Group_Name", orientation='h', title=f"Top 10 {tb_group.capitalize()}s", color_discrete_sequence=[GOLD_PRIMARY])
+                    fig_top.update_layout(yaxis={'categoryorder':'total ascending'}, template=PLOTLY_TEMPLATE, paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
+                    st.plotly_chart(fig_top, use_container_width=True)
+            with c2:
+                if not bottom_df.empty:
+                    fig_bot = px.bar(bottom_df, x="Value", y="Group_Name", orientation='h', title=f"Bottom 10 {tb_group.capitalize()}s", color_discrete_sequence=["#8B0000"])
+                    fig_bot.update_layout(yaxis={'categoryorder':'total descending'}, template=PLOTLY_TEMPLATE, paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
+                    st.plotly_chart(fig_bot, use_container_width=True)
+    except Exception as e:
+        st.error(f"Error loading performers: {e}")
+
 
 with tab2:
     st.header("Advanced Insights & ROI")
@@ -212,13 +237,35 @@ with tab2:
     st.markdown("---")
         
     # 3. Features
-    st.subheader("Feature Premiums (Beta)")
+    st.subheader("Feature Premiums & Floor Distributions")
     try:
-        f_resp = requests.get(f"{API_BASE_URL}/market/insights/unified/feature_prices").json()
-        if f_resp.get("status") == "success":
-            st.json(f_resp["data"])
-    except:
-        pass
+        f_resp = requests.get(f"{API_BASE_URL}/market/insights/unified/feature_prices", params=build_params()).json()
+        if f_resp.get("status") == "success" and f_resp.get("data"):
+            f_data = f_resp["data"]
+            
+            # Amenities Bar Chart
+            features_list = ["Balcony", "Metro", "Elevator", "Swimming Pool"]
+            amenities_data = []
+            for feat in features_list:
+                if feat in f_data:
+                    amenities_data.append({"Feature": feat, "Condition": "With", "Median Price": f_data[feat].get("With", 0)})
+                    amenities_data.append({"Feature": feat, "Condition": "Without", "Median Price": f_data[feat].get("Without", 0)})
+            
+            if amenities_data:
+                df_amenities = pd.DataFrame(amenities_data)
+                fig_feat = px.bar(df_amenities, x="Feature", y="Median Price", color="Condition", barmode="group", title="Feature Premium Comparison", color_discrete_map={"With": GOLD_PRIMARY, "Without": DARK_ACCENT})
+                fig_feat.update_layout(template=PLOTLY_TEMPLATE, paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
+                st.plotly_chart(fig_feat, use_container_width=True)
+            
+            # Floor Bin Distribution
+            if "Floor_Distribution" in f_data:
+                df_floor = pd.DataFrame(f_data["Floor_Distribution"])
+                if not df_floor.empty:
+                    fig_floor = px.bar(df_floor, x="Name", y="Median_Price", title="Median Price by Floor Bin", color_discrete_sequence=[GOLD_SECONDARY])
+                    fig_floor.update_layout(template=PLOTLY_TEMPLATE, paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
+                    st.plotly_chart(fig_floor, use_container_width=True)
+    except Exception as e:
+        st.error(f"Error loading features: {e}")
 
     st.markdown("---")
         
